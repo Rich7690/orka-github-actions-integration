@@ -102,8 +102,12 @@ func (p *RunnerMessageProcessor) processRunnerMessage(message *types.RunnerScale
 
 	p.logger.Infof("process batched runner scale set job messages with id %d and batch size %d", message.MessageId, len(batchedMessages))
 
-	requiredRunners := message.Statistics.TotalAssignedJobs - message.Statistics.TotalRegisteredRunners
+	inFlight := int(p.inFlightProvisioning.Load())
+	requiredRunners := message.Statistics.TotalAssignedJobs - message.Statistics.TotalRegisteredRunners - inFlight
 	provisionedRunners := 0
+
+	p.logger.Infof("Provisioning calculation - Required: %d (Assigned: %d - Registered: %d - InFlight: %d)",
+		requiredRunners, message.Statistics.TotalAssignedJobs, message.Statistics.TotalRegisteredRunners, inFlight)
 
 	var availableJobs []int64
 	for _, message := range batchedMessages {
@@ -131,69 +135,7 @@ func (p *RunnerMessageProcessor) processRunnerMessage(message *types.RunnerScale
 			if provisionedRunners < requiredRunners {
 				provisionedRunners++
 				p.logger.Infof("number of runners provisioning started: %d. Max required runners: %d", provisionedRunners, requiredRunners)
-
-				job := newJobIdentity(jobAssigned.JobId, jobAssigned.RunnerRequestId)
-
-				go func() {
-					var executionErr error
-
-					defer p.removeUpstreamCanceledJob(job)
-
-					executor, commands, provisioningErr := p.provisionRunnerWithRetry(p.ctx, job)
-					if provisioningErr != nil {
-						if errors.Is(provisioningErr, context.Canceled) {
-							p.logger.Infof("provisioning canceled for %s", p.runnerScaleSetName)
-						} else {
-							p.logger.Errorf("unable to provision Orka runner for %s: %v", p.runnerScaleSetName, provisioningErr)
-						}
-						return
-					}
-
-					if executor == nil {
-						p.logger.Errorf("provisioning returned nil executor for %s", p.runnerScaleSetName)
-						return
-					}
-
-					runnerContext, cancel := context.WithCancel(p.ctx)
-					p.storeRunnerContextCancel(executor.VMName, cancel)
-
-					context.AfterFunc(runnerContext, func() {
-						p.logger.Infof("cleaning up resources for %s after runner context is canceled", executor.VMName)
-						p.runnerProvisioner.CleanupResources(context.WithoutCancel(p.ctx), executor.VMName)
-						p.vmTracker.Untrack(executor.VMName)
-					})
-
-					defer func() {
-						if isNetworkingFailure(executionErr) {
-							p.logger.Warnf("SSH connection dropped for %s (%v). Skipping cleanup, relying on JobCompleted webhook.", job, executionErr)
-							return
-						}
-
-						var cancelReason string
-						var exitErr *ssh.ExitError
-
-						if errors.Is(executionErr, context.Canceled) {
-							cancelReason = "runner context was canceled"
-							p.logger.Infof("runner context canceled for RunnerName %s with %s. Cleaning up resources.", executor.VMName, job)
-						} else if executionErr != nil {
-							if errors.As(executionErr, &exitErr) {
-								cancelReason = fmt.Sprintf("execution failed with exit code %d", exitErr.ExitStatus())
-								p.logger.Errorf("execution failed with exit code %d for RunnerName %s with %s. Cleaning up resources.", exitErr.ExitStatus(), executor.VMName, job)
-							} else {
-								cancelReason = fmt.Sprintf("execution failed: %v", executionErr)
-								p.logger.Errorf("execution failed for RunnerName %s with %s. Cleaning up resources: %v", executor.VMName, job, executionErr)
-							}
-						} else {
-							cancelReason = "execution completed successfully"
-							p.logger.Infof("execution completed successfully for RunnerName %s with %s. Cleaning up resources.", executor.VMName, job)
-						}
-
-						p.cancelRunnerContext(executor.VMName, cancelReason)
-					}()
-
-					p.vmTracker.Track(executor.VMName)
-					executionErr = p.executeJobCommands(runnerContext, job, executor, commands)
-				}()
+				p.spawnRunnerForJob(newJobIdentity(jobAssigned.JobId, jobAssigned.RunnerRequestId))
 			}
 		case "JobStarted":
 			var jobStarted types.JobStarted
@@ -231,7 +173,107 @@ func (p *RunnerMessageProcessor) processRunnerMessage(message *types.RunnerScale
 		return fmt.Errorf("could not acquire jobs. %w", err)
 	}
 
+	currentInFlight := int(p.inFlightProvisioning.Load())
+	deficit := message.Statistics.TotalAssignedJobs - message.Statistics.TotalRegisteredRunners - currentInFlight
+	if deficit > 0 {
+		p.provisionForDeficit(deficit)
+	}
+
 	return nil
+}
+
+func (p *RunnerMessageProcessor) spawnRunnerForJob(job jobIdentity) {
+	p.inFlightProvisioning.Add(1)
+	go func() {
+		defer p.inFlightProvisioning.Add(-1)
+
+		var executionErr error
+
+		defer p.removeUpstreamCanceledJob(job)
+
+		executor, commands, provisioningErr := p.provisionRunnerWithRetry(p.ctx, job)
+		if provisioningErr != nil {
+			if errors.Is(provisioningErr, context.Canceled) {
+				p.logger.Infof("provisioning canceled for %s", p.runnerScaleSetName)
+			} else {
+				p.logger.Errorf("unable to provision Orka runner for %s: %v", p.runnerScaleSetName, provisioningErr)
+			}
+			return
+		}
+
+		if executor == nil {
+			p.logger.Errorf("provisioning returned nil executor for %s", p.runnerScaleSetName)
+			return
+		}
+
+		runnerContext, cancel := context.WithCancel(p.ctx)
+		p.storeRunnerContextCancel(executor.VMName, cancel)
+
+		context.AfterFunc(runnerContext, func() {
+			p.logger.Infof("cleaning up resources for %s after runner context is canceled", executor.VMName)
+			p.runnerProvisioner.CleanupResources(context.WithoutCancel(p.ctx), executor.VMName)
+			p.vmTracker.Untrack(executor.VMName)
+		})
+
+		defer func() {
+			if isNetworkingFailure(executionErr) {
+				p.logger.Warnf("SSH connection dropped for %s (%v). Skipping cleanup, relying on JobCompleted webhook.", job, executionErr)
+				return
+			}
+
+			var cancelReason string
+			var exitErr *ssh.ExitError
+
+			if errors.Is(executionErr, context.Canceled) {
+				cancelReason = "runner context was canceled"
+				p.logger.Infof("runner context canceled for RunnerName %s with %s. Cleaning up resources.", executor.VMName, job)
+			} else if executionErr != nil {
+				if errors.As(executionErr, &exitErr) {
+					cancelReason = fmt.Sprintf("execution failed with exit code %d", exitErr.ExitStatus())
+					p.logger.Errorf("execution failed with exit code %d for RunnerName %s with %s. Cleaning up resources.", exitErr.ExitStatus(), executor.VMName, job)
+				} else {
+					cancelReason = fmt.Sprintf("execution failed: %v", executionErr)
+					p.logger.Errorf("execution failed for RunnerName %s with %s. Cleaning up resources: %v", executor.VMName, job, executionErr)
+				}
+			} else {
+				cancelReason = "execution completed successfully"
+				p.logger.Infof("execution completed successfully for RunnerName %s with %s. Cleaning up resources.", executor.VMName, job)
+			}
+
+			p.cancelRunnerContext(executor.VMName, cancelReason)
+		}()
+
+		p.vmTracker.Track(executor.VMName)
+		executionErr = p.executeJobCommands(runnerContext, job, executor, commands)
+	}()
+}
+
+func (p *RunnerMessageProcessor) provisionForDeficit(deficit int) {
+	p.logger.Infof("detected %d assigned jobs without runners, fetching acquirable jobs to recover", deficit)
+
+	acquirableJobs, err := p.runnerManager.GetAcquirableJobs(p.ctx)
+	if err != nil {
+		p.logger.Errorf("failed to fetch acquirable jobs for deficit recovery: %v", err)
+		return
+	}
+
+	provisioned := 0
+	for _, aj := range acquirableJobs.Jobs {
+		if provisioned >= deficit {
+			break
+		}
+
+		if aj.MessageType != "JobAssigned" {
+			continue
+		}
+
+		provisioned++
+		job := newJobIdentity("", aj.RunnerRequestId)
+		p.logger.Infof("deficit recovery: provisioning runner for RunnerRequestId: %d (%d/%d)", aj.RunnerRequestId, provisioned, deficit)
+		p.spawnRunnerForJob(job)
+	}
+
+	p.logger.Infof("deficit recovery complete: provisioned %d runners out of %d deficit", provisioned, deficit)
 }
 
 func (p *RunnerMessageProcessor) provisionRunnerWithRetry(ctx context.Context, job jobIdentity) (*orka.VMCommandExecutor, []string, error) {

@@ -7,6 +7,7 @@ package runners
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/macstadium/orka-github-actions-integration/pkg/github/actions"
 	"github.com/macstadium/orka-github-actions-integration/pkg/github/messagequeue"
@@ -18,6 +19,7 @@ import (
 type RunnerManagerInterface interface {
 	ProcessMessages(ctx context.Context, handler func(msg *types.RunnerScaleSetMessage) error) error
 	AcquireJobs(ctx context.Context, requestIds []int64) error
+	GetAcquirableJobs(ctx context.Context) (*types.AcquirableJobList, error)
 }
 
 type RunnerManager struct {
@@ -43,6 +45,7 @@ type RunnerMessageProcessor struct {
 	runnerProvisioner         RunnerProvisionerInterface
 	vmTracker                 *VMTracker
 	runnerScaleSetName        string
+	inFlightProvisioning      atomic.Int32
 	upstreamCanceledJobs      map[jobIdentity]bool
 	upstreamCanceledJobsMutex sync.RWMutex
 	runnerContextCancels      map[string]context.CancelFunc

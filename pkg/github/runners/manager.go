@@ -176,6 +176,10 @@ func (m *RunnerManager) deleteMessage(ctx context.Context, messageID int64) erro
 	return nil
 }
 
+func (m *RunnerManager) GetAcquirableJobs(ctx context.Context) (*types.AcquirableJobList, error) {
+	return m.actionsClient.GetAcquirableJobs(ctx, m.runnerScaleSetId)
+}
+
 func (m *RunnerManager) AcquireJobs(ctx context.Context, requestIds []int64) error {
 	m.logger.Infof("Acquiring jobs. Number of requests: %d, Request IDs: %s", len(requestIds), fmt.Sprint(requestIds))
 	if len(requestIds) == 0 {
